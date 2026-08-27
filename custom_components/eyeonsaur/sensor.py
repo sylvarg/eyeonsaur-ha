@@ -9,7 +9,6 @@ from typing import Any
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
-    SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
@@ -41,8 +40,6 @@ async def async_setup_entry(
         "coordinator"
     ]
     entities: list[EyeOnSaurSensor] = []
-    statistic_entities: list[SaurStatisticsSensor] = []  # Ajout Type
-
     for compteur in coordinator.data.compteurs:
         if compteur.isContractTerminated:
             continue  # Ignore les compteurs avec contrat terminé
@@ -74,19 +71,12 @@ async def async_setup_entry(
         ]
 
         entities.extend(
-            EyeOnSaurSensor(
-                coordinator, compteur, sensor, device_info_compteur
-            )
+            EyeOnSaurSensor(coordinator, compteur, sensor, device_info_compteur)
             for sensor in sensor_types
         )
         # entities.append(EyeOnSaurSensor(coordinator,
         # compteur, "water_consumption", device_info))
-        statistic_entities.append(
-            SaurStatisticsSensor(compteur, device_info_compteur)
-        )  # Appel du nouveau sensor
-
     async_add_entities(entities, update_before_add=True)
-    async_add_entities(statistic_entities, update_before_add=True)
 
 
 class EyeOnSaurSensor(CoordinatorEntity[SaurCoordinator], SensorEntity):
@@ -174,38 +164,3 @@ class EyeOnSaurSensor(CoordinatorEntity[SaurCoordinator], SensorEntity):
         if self._sensor_type == "last_reading_value":
             return {"last_updated": self._compteur.releve_physique.date}
         return None
-
-
-class SaurStatisticsSensor(SensorEntity):
-    """
-    Représentation d'un capteur de consommation d'eau SAUR
-    pour les statistiques."""
-
-    _attr_has_entity_name = True
-    _attr_translation_key = "water_consumption"
-    _attr_device_class = SensorDeviceClass.WATER
-    _attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_suggested_display_precision = 2
-    _attr_should_poll = False
-    _attr_disabled_by_default = True
-    _attr_native_value = None  # Jamais de valeur
-
-    def __init__(
-        self,
-        compteur: Compteur,
-        device_info: DeviceInfo,
-    ) -> None:
-        """Initialise le capteur."""
-        self._attr_unique_id = f"{compteur.serial_number}_water_statistics"
-        self.compteur: Compteur = compteur
-        self._attr_device_info = device_info
-        self._attr_name = "Panneau Énergie"
-
-    # @cached_property
-    # def native_value(self) -> None:
-    #     return None
-
-    # @cached_property
-    # def should_poll(self) -> bool:
-    #     return False

@@ -1,92 +1,86 @@
-"""Module d'injection de données historiques dans le recorder."""
-
-# pylint: disable=E0401
+"""Import EyeOnSaur historical data as external statistics."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from homeassistant.components.recorder.models import (
     StatisticData,
+    StatisticMeanType,
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
-    # StatisticData,
-    # StatisticMetaData,
-    async_import_statistics,
+    async_add_external_statistics,
 )
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
-from homeassistant.util.dt import as_local
+from homeassistant.util import dt as dt_util
+from homeassistant.util import slugify
+
+from .helpers.const import DOMAIN
+from .models import SectionId, TheoreticalConsumptionDatas
 
 _LOGGER = logging.getLogger(__name__)
 
+STATISTIC_UNIT_CLASS = "volume"
+
+
+def water_statistic_id(section_id: SectionId) -> str:
+    """Build the stable external statistic ID for a SAUR section."""
+    object_id = slugify(f"{section_id}_water_consumption")
+    if not object_id:
+        raise ValueError("A section ID is required to build a statistic ID")
+    return f"{DOMAIN}:{object_id}"
+
 
 class SaurRecorder:
-    """Service pour injecter des données.
+    """Import cumulative water-meter readings into the HA recorder."""
 
-    Service d'injection historiques dans le
-    recorder de Home Assistant."""
-
-    __skip__ = True  # Alternative pour ignorer le warning
-
-    def __init__(self, hass: HomeAssistant):
-        """Initialiser le service."""
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the recorder service."""
         self.hass = hass
 
     async def async_inject_historical_data(
         self,
-        entity_id: str,
-        date: datetime,
-        value: float,
+        statistic_id: str,
+        statistic_name: str,
+        consumptions: TheoreticalConsumptionDatas,
     ) -> None:
-        """Injecte des données historiques pour un capteur spécifique."""
+        """Import cumulative readings as an external HA statistic."""
+        metadata: StatisticMetaData = {
+            "has_sum": True,
+            "mean_type": StatisticMeanType.NONE,
+            "name": statistic_name,
+            "source": DOMAIN,
+            "statistic_id": statistic_id,
+            "unit_class": STATISTIC_UNIT_CLASS,
+            "unit_of_measurement": UnitOfVolume.CUBIC_METERS,
+        }
+
+        statistics: list[StatisticData] = []
+        today = dt_util.now().date()
+        for consumption in sorted(consumptions, key=lambda item: item.date):
+            consumption_date = datetime.fromisoformat(consumption.date).date()
+            if consumption_date > today:
+                continue
+
+            # SAUR values are daily local readings. Recorder accepts timezone-
+            # aware timestamps at the top of an hour and normalizes them to
+            # UTC.
+            start = dt_util.start_of_local_day(consumption_date)
+            statistics.append(
+                StatisticData(
+                    start=start,
+                    state=consumption.indexValue,
+                    sum=consumption.indexValue,
+                )
+            )
+
+        if not statistics:
+            return
+
+        async_add_external_statistics(self.hass, metadata, statistics)
         _LOGGER.debug(
-            "Injecting historical data for {%s} at {%s} with value {%s}",
-            entity_id,
-            date,
-            value,
-        )
-
-        # statistic_id = "sensor.compteur_saur_" + entity_id
-        statistic_id = entity_id
-        epoch = datetime(1970, 1, 1, 0, 0, 0)
-        epoch = as_local(epoch)
-        start_of_day = datetime(date.year, date.month, date.day, 1, 0, 0)
-        start_of_day = as_local(start_of_day)
-        end_of_day = datetime(date.year, date.month, date.day, 23, 59, 59)
-        end_of_day = as_local(end_of_day)
-
-        metadata: StatisticMetaData = StatisticMetaData(
-            has_mean=False,
-            has_sum=True,
-            name=f"EyeOnSaur Consumption of {statistic_id}",
-            source="recorder",
-            statistic_id=statistic_id,
-            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        )
-
-        interval = timedelta(hours=1)
-        stats: list[StatisticData] = []
-        current_time = start_of_day + 0 * interval
-        _LOGGER.debug(
-            " 📜 for %s at %s with value %s",
+            "Imported %s historical points for %s",
+            len(statistics),
             statistic_id,
-            current_time,
-            value,
-        )
-        stats.append(
-            StatisticData(
-                start=current_time,
-                last_reset=epoch,
-                sum=value,
-            ),
-        )
-
-        async_import_statistics(self.hass, metadata, stats)
-
-        _LOGGER.debug(
-            "Injected historical data for %s at %s with value %s",
-            statistic_id,
-            date,
-            value,
         )
