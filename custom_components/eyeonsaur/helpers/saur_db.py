@@ -4,10 +4,12 @@
 import logging
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 from datetime import datetime
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from ..models import (
     ConsumptionDatas,
@@ -64,7 +66,7 @@ class SaurDatabaseHelper:
         def execute() -> SaurSqliteResponse:
             """Exécute la requête SQL dans un thread."""
             try:
-                with sqlite3.connect(self.db_path) as conn:
+                with closing(sqlite3.connect(self.db_path)) as conn:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
                     _LOGGER.debug(
@@ -136,9 +138,21 @@ class SaurDatabaseHelper:
         """
 
         count = 0
+        future_count = 0
+        today = dt_util.now().date()
         for conso in consumptions:
             if conso.rangeType == "Day":
-                date_str = datetime.fromisoformat(conso.startDate).strftime(
+                consumption_datetime = datetime.fromisoformat(conso.startDate)
+                consumption_date = (
+                    dt_util.as_local(consumption_datetime).date()
+                    if consumption_datetime.tzinfo is not None
+                    else consumption_datetime.date()
+                )
+                if consumption_date > today:
+                    future_count += 1
+                    continue
+
+                date_str = consumption_datetime.strftime(
                     "%Y-%m-%d %H:%M:%S",
                 )
                 value = conso.value
@@ -158,6 +172,12 @@ class SaurDatabaseHelper:
             count,
             section_id,
         )
+        if future_count:
+            _LOGGER.debug(
+                "%s consommations futures ignorées pour %s.",
+                future_count,
+                section_id,
+            )
 
     async def async_update_anchor(
         self, releve: RelevePhysique, section_id: SectionId
@@ -271,7 +291,8 @@ class SaurDatabaseHelper:
                 c.relative_value,
                 SUM(c.relative_value) OVER (ORDER BY c.date ASC)
                 AS cumulative_relative
-            FROM consumptions c WHERE c.section_id = ?
+            FROM consumptions c
+            WHERE c.section_id = ? AND c.date <= ?
             ),
             ReferenceCumulative AS (
             SELECT cumulative_relative
@@ -285,14 +306,22 @@ class SaurDatabaseHelper:
                 cw.relative_value,
                 COALESCE((SELECT value FROM Anchor), 0)
                     + cw.cumulative_relative
-                    - COALESCE((SELECT cumulative_relative FROM ReferenceCumulative), 0)
+                    - COALESCE(
+                        (SELECT cumulative_relative FROM ReferenceCumulative),
+                        0
+                    )
                     AS absolute_value
             FROM ConsumptionsWithCumulative cw
             ORDER BY cw.date DESC;
         """
 
         results = await self._async_execute_query(
-            query, (section_id, section_id)
+            query,
+            (
+                section_id,
+                section_id,
+                f"{dt_util.now().date().isoformat()} 23:59:59",
+            ),
         )
 
         nb_results = len(results) if results else 0
@@ -332,7 +361,8 @@ class SaurDatabaseHelper:
                 except Exception as e:
                     _LOGGER.error(
                         "Erreur lors de la création du "
-                        "TheoreticalConsumptionData : %s", e
+                        "TheoreticalConsumptionData : %s",
+                        e,
                     )
 
         return formatted_results
