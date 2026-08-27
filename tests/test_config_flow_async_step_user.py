@@ -172,7 +172,7 @@ async def test_async_step_user_reauth(hass: HomeAssistant) -> None:
             new_callable=AsyncMock,
         ) as mock_check,
         patch.object(
-            hass.config_entries, "async_update_entry", new_callable=AsyncMock
+            hass.config_entries, "async_update_entry", new_callable=MagicMock
         ) as mock_update,
         patch.object(
             hass.config_entries, "async_reload", new_callable=AsyncMock

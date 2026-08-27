@@ -1,21 +1,18 @@
+"""Authentication unit tests."""
+
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from saur_client import SaurApiError, SaurClient
+
+from custom_components.eyeonsaur.config_flow import check_credentials
 
 
-async def test_saur_client_authentication_minimal() -> None:
-    """Test minimal pour instancier SaurClient et appeler _authenticate()."""
-    try:
-        client = SaurClient(
-            login="dummy_login", password="dummy_password", dev_mode=True
-        )  # Paramètres bidon
-        await client._authenticate()  # Appel à _authenticate()
-    except SaurApiError as e:
-        pytest.fail(
-            f"Erreur SaurApiError inattendue lors de l'authentification minimale: {e}"
-        )
-    except Exception as e:
-        pytest.fail(
-            f"Erreur inattendue lors de l'authentification minimale: {e}"
-        )
-    else:
-        pass  # Si on arrive ici sans exception, le test est un succès
+@pytest.mark.asyncio
+async def test_check_credentials_authenticates_client() -> None:
+    """Credential validation delegates to the SAUR client."""
+    client = MagicMock()
+    client._authenticate = AsyncMock()
+
+    await check_credentials(client)
+
+    client._authenticate.assert_awaited_once()

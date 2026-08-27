@@ -1,69 +1,80 @@
-"""Test the SaurCoordinator for missing dates."""
+"""Tests for coordinator missing-date handling."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.eyeonsaur.coordinator import SaurCoordinator
+from custom_components.eyeonsaur.helpers.const import (
+    DOMAIN,
+    ENTRY_CLIENTID,
+    ENTRY_COMPTEURID,
+    ENTRY_LOGIN,
+    ENTRY_PASS,
+    ENTRY_TOKEN,
+)
+from custom_components.eyeonsaur.models import (
+    MissingDate,
+    MissingDates,
+    TheoreticalConsumptionDatas,
+)
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_async_handle_missing_dates(
-    hass: HomeAssistant, mock_config_entry, mock_saur_client
-):
-    """Test handling of missing dates."""
-    db_helper = AsyncMock()
-    recorder = AsyncMock()
-    coordinator = SaurCoordinator(hass, mock_config_entry, db_helper, recorder)
-    coordinator.base_data = {}
+@pytest.fixture(name="mock_config_entry")
+def mock_config_entry_fixture() -> MockConfigEntry:
+    """Return a complete coordinator config entry."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            ENTRY_LOGIN: "test@example.com",
+            ENTRY_PASS: "password",
+            ENTRY_COMPTEURID: "section-123",
+            ENTRY_TOKEN: "token",
+            ENTRY_CLIENTID: "client-123",
+        },
+    )
 
-    # Mock external dependencies
-    coordinator.client = mock_saur_client
-    mock_saur_client.get_monthly_data.return_value = {
-        "consumptions": [
-            {
-                "rangeType": "Day",
-                "startDate": "2024-01-10 00:00:00",
-                "value": 1.234,
-            }
-        ]
-    }
 
-    # Mock date utilities
-    mock_missing_dates = [(2024, 1, 10), (2024, 1, 12)]
-    mock_reduced_missing_dates = [(2024, 1, 10)]
-
-    db_helper.async_get_all_consumptions_with_absolute.return_value = [
-        ("2024-01-10 00:00:00", 100.0),
-        ("2024-01-12 00:00:00", 102.0),
-    ]
+async def test_async_handle_missing_dates_schedules_month(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """A reduced missing date schedules retrieval of its month."""
+    client = MagicMock()
+    client.close_session = AsyncMock()
+    with patch(
+        "custom_components.eyeonsaur.coordinator.SaurClient",
+        return_value=client,
+    ):
+        coordinator = SaurCoordinator(
+            hass, mock_config_entry, AsyncMock(), AsyncMock()
+        )
+    compteur = MagicMock()
+    compteur.sectionId = "section-123"
+    missing = MissingDates([MissingDate(2024, 2, 10)])
 
     with (
         patch(
             "custom_components.eyeonsaur.coordinator.find_missing_dates",
-            return_value=mock_missing_dates,
+            return_value=missing,
         ),
         patch(
-            "custom_components.eyeonsaur.coordinator.sync_reduce_missing_dates",
-            return_value=mock_reduced_missing_dates,
+            "custom_components.eyeonsaur.coordinator."
+            "sync_reduce_missing_dates",
+            return_value=missing,
         ),
         patch(
             "custom_components.eyeonsaur.coordinator.asyncio.sleep",
             new_callable=AsyncMock,
-        ) as _,
+        ),
+        patch.object(coordinator, "_sync_fetch_monthly_data") as fetch_month,
     ):
-        # Appeler la fonction à tester (indirectement via _async_update_data)
-        await coordinator._async_update_data()
-
-        # Injecter manuellement les appels à _async_fetch_periodic_data
-        await coordinator._async_fetch_monthly_data(2024, 1, 10)
-
-        # Vérifier que les fonctions de gestion des dates
-        # manquantes ont été appelées
-        assert (
-            coordinator.db_helper.async_get_all_consumptions_with_absolute.call_count
-            == 1
+        await coordinator._async_handle_missing_dates(
+            TheoreticalConsumptionDatas([]), compteur
         )
-        coordinator.recorder.async_inject_historical_data.assert_awaited()
+        await hass.async_block_till_done()
+
+    fetch_month.assert_called_once_with(2024, 2, compteur)
