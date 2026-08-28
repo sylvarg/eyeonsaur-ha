@@ -100,6 +100,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         # Ajout de la blacklist
         self.blacklisted_months: set[tuple[int, int]] = set()
         self._background_tasks: list[Task[None]] = []
+        self.latest_water_indexes: dict[SectionId, float] = {}
 
     async def async_shutdown(self) -> None:
         """
@@ -223,9 +224,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
 
     async def _async_update_data(self) -> SaurData:
         """Fetch data from the API and update the database."""
-        _LOGGER.debug(
-            "🔥🔥🔥🔥 _async_update_data 🔥🔥🔥🔥",
-        )
+        _LOGGER.debug("Updating EyeOnSaur data")
         now: datetime = datetime.now()
 
         if (
@@ -249,6 +248,14 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             )
             self._background_tasks.append(task)
         await asyncio.gather(*self._background_tasks)
+
+        # Weekly data and a possibly newer physical reading can both change
+        # the calculated meter index. Refresh the external statistic and the
+        # display-only sensor once both have been persisted.
+        for compteur in self._cached_data.compteurs:
+            if compteur.isContractTerminated:
+                continue
+            await self._async_refresh_historical_data(compteur)
 
         return self._cached_data
 
@@ -376,7 +383,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     ) -> None:
         """Wrapper pour la récupération des données hebdomadaires."""
         _LOGGER.debug(
-            "🔥🔥 _async_fetch_monthly_data  %s %s no_day for %s 🔥🔥",
+            "Fetching monthly data for %s-%02d (%s)",
             year,
             month,
             compteur.sectionId,
@@ -384,25 +391,22 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         await self._async_apifetch_and_sqlstore_monthly_data(
             year, month, compteur.sectionId
         )
-        _LOGGER.debug(
-            "🔥🔥 async_get_all_consumptions_with_absolute  %s 🔥🔥",
-            compteur.sectionId,
-        )
-        # Get all consumptions from SQLITE
-        all_consumptions: TheoreticalConsumptionDatas = (
+        all_consumptions = await self._async_refresh_historical_data(compteur)
+
+        # Détecte et traite les jours manquants
+        await self._async_handle_missing_dates(all_consumptions, compteur)
+
+    async def _async_refresh_historical_data(
+        self, compteur: Compteur
+    ) -> TheoreticalConsumptionDatas:
+        """Recalculate and import the cumulative history for a meter."""
+        all_consumptions = (
             await self.db_helper.async_get_all_consumptions_with_absolute(
                 compteur.sectionId
             )
         )
-        _LOGGER.debug(
-            "🔥🔥 TheoreticalConsumptionDatas  %s 🔥🔥",
-            all_consumptions,
-        )
-        # Recalculate all historical data
         await self._async_inject_historical_data(all_consumptions, compteur)
-
-        # Détecte et traite les jours manquants
-        await self._async_handle_missing_dates(all_consumptions, compteur)
+        return all_consumptions
 
     async def _async_inject_historical_data(
         self,
@@ -411,7 +415,26 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     ) -> None:
         """Injecte les données historiques dans le recorder."""
         if not all_consumptions:
+            self.latest_water_indexes.pop(compteur.sectionId, None)
             return
+
+        today = hass_now().date()
+        current_consumptions = [
+            consumption
+            for consumption in all_consumptions
+            if datetime.fromisoformat(consumption.date).date() <= today
+        ]
+        if not current_consumptions:
+            self.latest_water_indexes.pop(compteur.sectionId, None)
+            return
+
+        latest_consumption = max(
+            current_consumptions,
+            key=lambda consumption: datetime.fromisoformat(consumption.date),
+        )
+        self.latest_water_indexes[compteur.sectionId] = float(
+            latest_consumption.indexValue
+        )
 
         statistic_id = water_statistic_id(compteur.sectionId)
         statistic_name = f"Consommation d'eau SAUR {compteur.serial_number}"
@@ -427,15 +450,16 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         compteur: Compteur,
     ) -> None:
         """Gère les dates manquantes."""
-        _LOGGER.debug("🔥🔥 missing_dates 1/3: %s 🔥🔥", all_consumptions)
         missing_dates: MissingDates = find_missing_dates(all_consumptions)
-        _LOGGER.debug("🔥🔥 missing_dates 2/3: %s 🔥🔥", missing_dates)
 
         reduced_missing_dates = sync_reduce_missing_dates(
             missing_dates, self.blacklisted_months
         )
         _LOGGER.debug(
-            "🔥🔥 reduced_missing_dates 3/3: %s 🔥🔥", reduced_missing_dates
+            "%s missing date ranges detected for %s (%s after filtering)",
+            len(missing_dates),
+            compteur.sectionId,
+            len(reduced_missing_dates),
         )
         if reduced_missing_dates and len(reduced_missing_dates) > 0:
             # y, m, d = reduced_missing_dates.pop()

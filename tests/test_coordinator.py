@@ -155,8 +155,11 @@ async def test_historical_injection_does_not_use_entity_registry(
     consumptions = TheoreticalConsumptionDatas(
         [
             TheoreticalConsumptionData(
+                date=StrDate("2024-01-02 00:00:00"), indexValue=101.5
+            ),
+            TheoreticalConsumptionData(
                 date=StrDate("2024-01-01 00:00:00"), indexValue=100.0
-            )
+            ),
         ]
     )
 
@@ -167,3 +170,60 @@ async def test_historical_injection_does_not_use_entity_registry(
         "Consommation d'eau SAUR SERIAL-123",
         consumptions,
     )
+    assert coordinator.latest_water_indexes[compteur.sectionId] == 101.5
+
+
+async def test_periodic_update_refreshes_index_after_weekly_and_anchor_data(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """The display sensor and external statistic stay current after setup."""
+    coordinator, _, _ = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    coordinator._cached_data = SaurData(
+        saurClientId=ClientId("client-123"),
+        compteurs=Compteurs([compteur]),
+        contracts=Contracts([]),
+    )
+    coordinator._async_fetch_and_store_weekly_data = AsyncMock()
+    coordinator._async_backgroundupdate_data = AsyncMock()
+    coordinator._async_refresh_historical_data = AsyncMock(
+        return_value=TheoreticalConsumptionDatas([])
+    )
+
+    result = await coordinator._async_update_data()
+
+    assert result is coordinator._cached_data
+    coordinator._async_fetch_and_store_weekly_data.assert_awaited_once_with(
+        compteur=compteur
+    )
+    coordinator._async_backgroundupdate_data.assert_awaited_once_with(compteur)
+    coordinator._async_refresh_historical_data.assert_awaited_once_with(
+        compteur
+    )
+
+
+async def test_estimated_index_ignores_future_consumptions(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """A future API placeholder must not become the displayed index."""
+    coordinator, _, recorder = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    consumptions = TheoreticalConsumptionDatas(
+        [
+            TheoreticalConsumptionData(
+                date=StrDate("2026-08-28 00:00:00"), indexValue=211.29
+            ),
+            TheoreticalConsumptionData(
+                date=StrDate("2026-08-29 00:00:00"), indexValue=999.0
+            ),
+        ]
+    )
+
+    with patch(
+        "custom_components.eyeonsaur.coordinator.hass_now",
+        return_value=datetime(2026, 8, 28, 12, tzinfo=UTC),
+    ):
+        await coordinator._async_inject_historical_data(consumptions, compteur)
+
+    assert coordinator.latest_water_indexes[compteur.sectionId] == 211.29
+    recorder.async_inject_historical_data.assert_awaited_once()
