@@ -69,11 +69,6 @@ class SaurDatabaseHelper:
                 with closing(sqlite3.connect(self.db_path)) as conn:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
-                    _LOGGER.debug(
-                        "Exécution de la requête SQL: %s avec params : %s",
-                        query,
-                        params,
-                    )
                     cursor.execute(query, params)
                     conn.commit()
                     result = cursor.fetchall()
@@ -125,10 +120,6 @@ class SaurDatabaseHelper:
             section_id: L'identifiant unique du compteur.
 
         """
-        _LOGGER.debug(
-            "Début de la mise à jour des consommations dans la bdd pour %s",
-            section_id,
-        )
         query = """
             INSERT INTO consumptions (date, section_id,
                 relative_value, is_ancre)
@@ -155,29 +146,16 @@ class SaurDatabaseHelper:
                 date_str = consumption_datetime.strftime(
                     "%Y-%m-%d %H:%M:%S",
                 )
-                value = conso.value
-                _LOGGER.debug(
-                    "Préparation de l'insertion/mise à jour de la consommation"
-                    " pour date=%s, value=%s, section_id=%s",
-                    date_str,
-                    value,
-                    section_id,
-                )
                 await self._async_execute_query(
-                    query, (date_str, section_id, value)
+                    query, (date_str, section_id, conso.value)
                 )
                 count += 1
         _LOGGER.debug(
-            "Mise à jour de %s consommations dans la base de données pour %s.",
+            "Stored %s daily consumptions for %s (%s future entries ignored)",
             count,
             section_id,
+            future_count,
         )
-        if future_count:
-            _LOGGER.debug(
-                "%s consommations futures ignorées pour %s.",
-                future_count,
-                section_id,
-            )
 
     async def async_update_anchor(
         self, releve: RelevePhysique, section_id: SectionId
@@ -205,9 +183,7 @@ class SaurDatabaseHelper:
             ),
         )
 
-        _LOGGER.info(
-            "Ancre mise à jour dans la base de données pour %s.", section_id
-        )
+        _LOGGER.debug("Updated physical meter reading for %s", section_id)
 
     async def async_get_total_consumption(
         self, target_date: datetime, section_id: SectionId
@@ -274,10 +250,6 @@ class SaurDatabaseHelper:
         Returns:
             Une liste de TheoreticalConsumptionData.
         """
-
-        _LOGGER.debug(
-            "async_get_all_consumptions_with_absolute pour %s", section_id
-        )
 
         query = """
             WITH Anchor AS (

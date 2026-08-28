@@ -114,7 +114,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     async def async_config_entry_first_refresh(self) -> None:
         """Handle the first refresh."""
 
-        _LOGGER.debug("🔥🔥 async_config_entry_first_refresh 🔥🔥")
+        _LOGGER.debug("Starting initial EyeOnSaur refresh")
         await self.db_helper.async_init_db()
 
         response_contrats: SaurResponseContracts = (
@@ -124,7 +124,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             raise HomeAssistantError(
                 "Impossible de récupérer les contrats depuis l'API SAUR."
             )
-        _LOGGER.debug("🔥🔥 response_contrats %s 🔥🔥", response_contrats)
         _update_token_in_config_entry(self.hass, self.entry, self.client)
 
         # Extraction des contrats
@@ -144,8 +143,11 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         ]
 
         compteurs: Compteurs = extract_compteurs_from_area(response_contrats)
-        for compteur in compteurs:
-            _LOGGER.debug(" J'AI UN COMPTEUR : %s", compteur)
+        _LOGGER.debug(
+            "Retrieved %s contract(s) and %s meter(s) from SAUR",
+            len(contracts),
+            len(compteurs),
+        )
 
         self._cached_data = SaurData(
             saurClientId=self._cached_data.saurClientId,
@@ -157,7 +159,10 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             self._cached_data
         )
 
-        _LOGGER.debug("🔥🔥 self._cached_data %s 🔥🔥", self._cached_data)
+        _LOGGER.debug(
+            "Loaded delivery and reading data for %s meter(s)",
+            len(self._cached_data.compteurs),
+        )
 
         # now: datetime = (
         #     datetime.now(UTC) - timedelta(days=1) - timedelta(hours=10)
@@ -293,11 +298,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
                 await self.db_helper.async_write_consumptions(
                     consumptiondatas, SectionId(compteur.sectionId)
                 )
-                _LOGGER.debug(
-                    "🔥🔥 Données hebdomadaires stockées dans la base"
-                    "de données pour %s 🔥🔥",
-                    compteur.sectionId,
-                )
             else:
                 _LOGGER.debug(
                     "Aucune donnée hebdomadaire à stocker pour %s",
@@ -311,9 +311,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
 
     async def _async_backgroundupdate_data(self, compteur: Compteur) -> None:
         """Background task to fetch data from API and update."""
-        _LOGGER.debug(
-            "🔥🔥🔥🔥🔥🔥 _async_backgroundupdate_data 🔥🔥🔥🔥🔥🔥",
-        )
         # Récupération de l'ancre
         await self._async_apifetch_lastknown_data(compteur)
 
@@ -326,10 +323,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         """Fetch the last known data from the API."""
         lastknown_data: SaurResponseLastKnow = (
             await self.client.get_lastknown_data(compteur.sectionId)
-        )
-        _LOGGER.debug(
-            "🔥🔥 _async_apifetch_lastknown_data %s 🔥🔥",
-            lastknown_data,
         )
 
         if lastknown_data and "readingDate" in lastknown_data:
@@ -536,8 +529,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         des points de livraison.
         """
         compteurs = saur_data.compteurs
-        for compteur in compteurs:
-            _LOGGER.debug(" J'AI UN COMPTEUR : %s", compteur)
 
         # 1. Lancer toutes les requêtes DELIVERY en parallèle
         delivery_tasks = [

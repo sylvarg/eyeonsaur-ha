@@ -155,7 +155,9 @@ async def test_async_init_db(db_helper: SaurDatabaseHelper) -> None:
     await db_helper._async_execute_query("SELECT 1")
 
 
-async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
+async def test_async_write_consumptions(
+    db_helper: SaurDatabaseHelper, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test async_write_consumptions."""
     await db_helper._async_execute_query("DELETE FROM consumptions")
     await db_helper._async_execute_query("DELETE FROM anchor_value")
@@ -163,7 +165,7 @@ async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
         [
             ConsumptionData(
                 startDate=StrDate("2024-01-01 00:00:00"),
-                value=1.0,
+                value=9876.543,
                 rangeType="Day",
             ),
             ConsumptionData(
@@ -173,9 +175,17 @@ async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
             ),
         ]
     )
-    await db_helper.async_write_consumptions(
-        consumptions, TEST_SECTION_ID
-    )  # Pass section_id
+    caplog.clear()
+    with caplog.at_level(
+        "DEBUG", logger="custom_components.eyeonsaur.helpers.saur_db"
+    ):
+        await db_helper.async_write_consumptions(
+            consumptions, TEST_SECTION_ID
+        )  # Pass section_id
+
+    assert "Stored 2 daily consumptions" in caplog.text
+    assert "9876.543" not in caplog.text
+    assert "INSERT INTO consumptions" not in caplog.text
 
     # Vérifier que les données sont bien écrites dans la base
     rows: SaurSqliteResponse = await db_helper._async_execute_query(
@@ -184,7 +194,7 @@ async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
     assert rows is not None
     assert len(rows) == 2
     assert rows[0]["date"] == "2024-01-01 00:00:00"
-    assert rows[0]["relative_value"] == 1.0
+    assert rows[0]["relative_value"] == 9876.543
     assert rows[0]["section_id"] == TEST_SECTION_ID
     assert rows[1]["date"] == "2024-01-02 00:00:00"
     assert rows[1]["relative_value"] == 2.0

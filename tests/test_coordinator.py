@@ -94,7 +94,9 @@ async def test_coordinator_init(
 
 
 async def test_initial_backfill_schedules_every_month_from_installation(
-    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An empty installation month cannot prevent later-month backfill."""
     mock_config_entry.add_to_hass(hass)
@@ -108,7 +110,11 @@ async def test_initial_backfill_schedules_every_month_from_installation(
     coordinator.client.get_contracts = AsyncMock(
         return_value={
             "clients": [
-                {"clientId": "client-123", "contractName": "Contrat test"}
+                {
+                    "clientId": "client-123",
+                    "contractName": "Contrat test",
+                    "address": "PRIVATE-STREET-SENTINEL",
+                }
             ]
         }
     )
@@ -118,6 +124,9 @@ async def test_initial_backfill_schedules_every_month_from_installation(
     )
 
     with (
+        caplog.at_level(
+            "DEBUG", logger="custom_components.eyeonsaur.coordinator"
+        ),
         patch(
             "custom_components.eyeonsaur.coordinator."
             "extract_compteurs_from_area",
@@ -148,6 +157,8 @@ async def test_initial_backfill_schedules_every_month_from_installation(
         call.kwargs["reconcile_history"] is False
         for call in fetch_month.await_args_list
     )
+    assert "Retrieved 1 contract(s) and 1 meter(s) from SAUR" in caplog.text
+    assert "PRIVATE-STREET-SENTINEL" not in caplog.text
 
 
 async def test_historical_injection_does_not_use_entity_registry(
