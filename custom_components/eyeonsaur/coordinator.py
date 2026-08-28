@@ -211,6 +211,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
                         year=year_cursor,
                         month=month_cursor,
                         compteur=compteur,
+                        reconcile_history=False,
                     )
                 )
                 self._background_tasks.append(task)
@@ -255,7 +256,10 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         for compteur in self._cached_data.compteurs:
             if compteur.isContractTerminated:
                 continue
-            await self._async_refresh_historical_data(compteur)
+            all_consumptions = await self._async_refresh_historical_data(
+                compteur
+            )
+            await self._async_handle_missing_dates(all_consumptions, compteur)
 
         return self._cached_data
 
@@ -379,9 +383,14 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     #     raise HomeAssistantError
 
     async def _async_fetch_monthly_data(
-        self, year: int, month: int, compteur: Compteur
+        self,
+        year: int,
+        month: int,
+        compteur: Compteur,
+        *,
+        reconcile_history: bool = True,
     ) -> None:
-        """Wrapper pour la récupération des données hebdomadaires."""
+        """Fetch a month and optionally reconcile the cumulative history."""
         _LOGGER.debug(
             "Fetching monthly data for %s-%02d (%s)",
             year,
@@ -391,6 +400,9 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         await self._async_apifetch_and_sqlstore_monthly_data(
             year, month, compteur.sectionId
         )
+        if not reconcile_history:
+            return
+
         all_consumptions = await self._async_refresh_historical_data(compteur)
 
         # Détecte et traite les jours manquants

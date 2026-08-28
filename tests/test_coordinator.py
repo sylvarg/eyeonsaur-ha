@@ -144,6 +144,10 @@ async def test_initial_backfill_schedules_every_month_from_installation(
         (call.kwargs["year"], call.kwargs["month"])
         for call in fetch_month.await_args_list
     ] == [(2024, 1), (2024, 2), (2024, 3), (2024, 4)]
+    assert all(
+        call.kwargs["reconcile_history"] is False
+        for call in fetch_month.await_args_list
+    )
 
 
 async def test_historical_injection_does_not_use_entity_registry(
@@ -189,6 +193,7 @@ async def test_periodic_update_refreshes_index_after_weekly_and_anchor_data(
     coordinator._async_refresh_historical_data = AsyncMock(
         return_value=TheoreticalConsumptionDatas([])
     )
+    coordinator._async_handle_missing_dates = AsyncMock()
 
     result = await coordinator._async_update_data()
 
@@ -200,6 +205,33 @@ async def test_periodic_update_refreshes_index_after_weekly_and_anchor_data(
     coordinator._async_refresh_historical_data.assert_awaited_once_with(
         compteur
     )
+    coordinator._async_handle_missing_dates.assert_awaited_once_with(
+        TheoreticalConsumptionDatas([]), compteur
+    )
+
+
+async def test_initial_month_fetch_defers_history_reconciliation(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Bulk backfill stores each month without repeatedly importing history."""
+    coordinator, _, _ = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    coordinator._async_apifetch_and_sqlstore_monthly_data = AsyncMock()
+    coordinator._async_refresh_historical_data = AsyncMock()
+    coordinator._async_handle_missing_dates = AsyncMock()
+
+    await coordinator._async_fetch_monthly_data(
+        2024,
+        1,
+        compteur,
+        reconcile_history=False,
+    )
+
+    coordinator._async_apifetch_and_sqlstore_monthly_data.assert_awaited_once_with(
+        2024, 1, compteur.sectionId
+    )
+    coordinator._async_refresh_historical_data.assert_not_awaited()
+    coordinator._async_handle_missing_dates.assert_not_awaited()
 
 
 async def test_estimated_index_ignores_future_consumptions(
