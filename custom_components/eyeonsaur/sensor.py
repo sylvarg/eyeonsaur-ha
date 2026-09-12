@@ -9,7 +9,6 @@ from typing import Any
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
-    SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
@@ -20,7 +19,6 @@ from homeassistant.helpers.device_registry import (
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
-from propcache.api import cached_property
 
 from .coordinator import SaurCoordinator
 from .device import Compteur
@@ -41,8 +39,6 @@ async def async_setup_entry(
         "coordinator"
     ]
     entities: list[EyeOnSaurSensor] = []
-    statistic_entities: list[SaurStatisticsSensor] = []  # Ajout Type
-
     for compteur in coordinator.data.compteurs:
         if compteur.isContractTerminated:
             continue  # Ignore les compteurs avec contrat terminé
@@ -71,22 +67,16 @@ async def async_setup_entry(
             "last_reading_value",
             "last_reading_date",
             "contract_terminated",
+            "estimated_meter_index",
         ]
 
         entities.extend(
-            EyeOnSaurSensor(
-                coordinator, compteur, sensor, device_info_compteur
-            )
+            EyeOnSaurSensor(coordinator, compteur, sensor, device_info_compteur)
             for sensor in sensor_types
         )
         # entities.append(EyeOnSaurSensor(coordinator,
         # compteur, "water_consumption", device_info))
-        statistic_entities.append(
-            SaurStatisticsSensor(compteur, device_info_compteur)
-        )  # Appel du nouveau sensor
-
     async_add_entities(entities, update_before_add=True)
-    async_add_entities(statistic_entities, update_before_add=True)
 
 
 class EyeOnSaurSensor(CoordinatorEntity[SaurCoordinator], SensorEntity):
@@ -115,7 +105,10 @@ class EyeOnSaurSensor(CoordinatorEntity[SaurCoordinator], SensorEntity):
         self._attr_should_poll = False
 
         # Définition du device_class et unité de mesure si nécessaire
-        if self._sensor_type == "last_reading_value":
+        if self._sensor_type in {
+            "last_reading_value",
+            "estimated_meter_index",
+        }:
             self._attr_device_class = SensorDeviceClass.WATER
             self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
         elif self._sensor_type in ["installation_date", "last_reading_date"]:
@@ -129,15 +122,21 @@ class EyeOnSaurSensor(CoordinatorEntity[SaurCoordinator], SensorEntity):
             "last_reading_value": "Dernier relevé (technicien)",
             "last_reading_date": "Date du dernier relevé (technicien)",
             "contract_terminated": "Contrat terminé",
-            "water_consumption": "Consommation d'eau",
+            "estimated_meter_index": "Index estimé du compteur",
         }.get(self._sensor_type, self._sensor_type)
 
-    @cached_property
+    @property
     def available(self) -> bool:  # pyright: ignore
         """Return if entity is available."""
-        return True
+        if self._sensor_type == "estimated_meter_index":
+            return (
+                super().available
+                and self._compteur.sectionId
+                in self._coordinator.latest_water_indexes
+            )
+        return super().available
 
-    @cached_property
+    @property
     def native_value(self) -> Any:
         """
         Retourne la valeur du capteur."""
@@ -165,47 +164,16 @@ class EyeOnSaurSensor(CoordinatorEntity[SaurCoordinator], SensorEntity):
             retour = self._compteur.isContractTerminated
         elif self._sensor_type == "last_reading_value":
             retour = self._compteur.releve_physique.valeur
+        elif self._sensor_type == "estimated_meter_index":
+            retour = self._coordinator.latest_water_indexes.get(
+                self._compteur.sectionId
+            )
 
         return retour  # Retourne la valeur à la fin
 
-    @cached_property
+    @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Retourne les attributs supplémentaires."""
         if self._sensor_type == "last_reading_value":
             return {"last_updated": self._compteur.releve_physique.date}
         return None
-
-
-class SaurStatisticsSensor(SensorEntity):
-    """
-    Représentation d'un capteur de consommation d'eau SAUR
-    pour les statistiques."""
-
-    _attr_has_entity_name = True
-    _attr_translation_key = "water_consumption"
-    _attr_device_class = SensorDeviceClass.WATER
-    _attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_suggested_display_precision = 2
-    _attr_should_poll = False
-    _attr_disabled_by_default = True
-    _attr_native_value = None  # Jamais de valeur
-
-    def __init__(
-        self,
-        compteur: Compteur,
-        device_info: DeviceInfo,
-    ) -> None:
-        """Initialise le capteur."""
-        self._attr_unique_id = f"{compteur.serial_number}_water_statistics"
-        self.compteur: Compteur = compteur
-        self._attr_device_info = device_info
-        self._attr_name = "Panneau Énergie"
-
-    # @cached_property
-    # def native_value(self) -> None:
-    #     return None
-
-    # @cached_property
-    # def should_poll(self) -> bool:
-    #     return False

@@ -12,7 +12,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
-from homeassistant.helpers.entity_registry import async_get
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
@@ -53,7 +52,7 @@ from .models import (
     StrDate,
     TheoreticalConsumptionDatas,
 )
-from .recorder import SaurRecorder
+from .recorder import SaurRecorder, water_statistic_id
 
 # Configuration du logging
 _LOGGER = logging.getLogger(__name__)
@@ -101,6 +100,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         # Ajout de la blacklist
         self.blacklisted_months: set[tuple[int, int]] = set()
         self._background_tasks: list[Task[None]] = []
+        self.latest_water_indexes: dict[SectionId, float] = {}
 
     async def async_shutdown(self) -> None:
         """
@@ -114,7 +114,7 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     async def async_config_entry_first_refresh(self) -> None:
         """Handle the first refresh."""
 
-        _LOGGER.debug("🔥🔥 async_config_entry_first_refresh 🔥🔥")
+        _LOGGER.debug("Starting initial EyeOnSaur refresh")
         await self.db_helper.async_init_db()
 
         response_contrats: SaurResponseContracts = (
@@ -124,7 +124,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             raise HomeAssistantError(
                 "Impossible de récupérer les contrats depuis l'API SAUR."
             )
-        _LOGGER.debug("🔥🔥 response_contrats %s 🔥🔥", response_contrats)
         _update_token_in_config_entry(self.hass, self.entry, self.client)
 
         # Extraction des contrats
@@ -144,8 +143,11 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         ]
 
         compteurs: Compteurs = extract_compteurs_from_area(response_contrats)
-        for compteur in compteurs:
-            _LOGGER.debug(" J'AI UN COMPTEUR : %s", compteur)
+        _LOGGER.debug(
+            "Retrieved %s contract(s) and %s meter(s) from SAUR",
+            len(contracts),
+            len(compteurs),
+        )
 
         self._cached_data = SaurData(
             saurClientId=self._cached_data.saurClientId,
@@ -157,7 +159,10 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             self._cached_data
         )
 
-        _LOGGER.debug("🔥🔥 self._cached_data %s 🔥🔥", self._cached_data)
+        _LOGGER.debug(
+            "Loaded delivery and reading data for %s meter(s)",
+            len(self._cached_data.compteurs),
+        )
 
         # now: datetime = (
         #     datetime.now(UTC) - timedelta(days=1) - timedelta(hours=10)
@@ -187,24 +192,45 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             )
 
             date_installation = as_local(
-                datetime.fromisoformat(compteur.releve_physique.date)
+                datetime.fromisoformat(compteur.date_installation)
             )
-            task = self.hass.async_create_task(
-                self._async_fetch_monthly_data(
-                    year=date_installation.year,
-                    month=date_installation.month,
-                    compteur=compteur,
+
+            # --- Correctif ---
+            # Le backfill automatique via "missing_dates" ne progresse
+            # que s'il y a déjà des données pour détecter des trous.
+            # Si le mois d'installation est vide, il ne va jamais
+            # chercher les mois suivants. On force donc ici la
+            # récupération de TOUS les mois entre l'installation
+            # et aujourd'hui.
+            year_cursor, month_cursor = (
+                date_installation.year,
+                date_installation.month,
+            )
+            now_local = hass_now()
+            while (year_cursor, month_cursor) <= (
+                now_local.year,
+                now_local.month,
+            ):
+                task = self.hass.async_create_task(
+                    self._async_fetch_monthly_data(
+                        year=year_cursor,
+                        month=month_cursor,
+                        compteur=compteur,
+                        reconcile_history=False,
+                    )
                 )
-            )
-            self._background_tasks.append(task)
+                self._background_tasks.append(task)
+                if month_cursor == 12:
+                    year_cursor += 1
+                    month_cursor = 1
+                else:
+                    month_cursor += 1
         # await asyncio.gather(*self._background_tasks)
         await super().async_config_entry_first_refresh()
 
     async def _async_update_data(self) -> SaurData:
         """Fetch data from the API and update the database."""
-        _LOGGER.debug(
-            "🔥🔥🔥🔥 _async_update_data 🔥🔥🔥🔥",
-        )
+        _LOGGER.debug("Updating EyeOnSaur data")
         now: datetime = datetime.now()
 
         if (
@@ -229,6 +255,17 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             self._background_tasks.append(task)
         await asyncio.gather(*self._background_tasks)
 
+        # Weekly data and a possibly newer physical reading can both change
+        # the calculated meter index. Refresh the external statistic and the
+        # display-only sensor once both have been persisted.
+        for compteur in self._cached_data.compteurs:
+            if compteur.isContractTerminated:
+                continue
+            all_consumptions = await self._async_refresh_historical_data(
+                compteur
+            )
+            await self._async_handle_missing_dates(all_consumptions, compteur)
+
         return self._cached_data
 
     async def _async_fetch_and_store_weekly_data(
@@ -238,13 +275,11 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         la base de données."""
         now: datetime = hass_now() - timedelta(days=2, hours=10)
         try:
-            weekly_data: SaurResponseWeekly = (
-                await self.client.get_weekly_data(
-                    now.year,
-                    now.month,
-                    now.day,
-                    compteur.sectionId,
-                )
+            weekly_data: SaurResponseWeekly = await self.client.get_weekly_data(
+                now.year,
+                now.month,
+                now.day,
+                compteur.sectionId,
             )
             if weekly_data and weekly_data.get("consumptions"):
                 # Transformer les données hebdomadaires en ConsumptionDatas
@@ -263,11 +298,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
                 await self.db_helper.async_write_consumptions(
                     consumptiondatas, SectionId(compteur.sectionId)
                 )
-                _LOGGER.debug(
-                    "🔥🔥 Données hebdomadaires stockées dans la base"
-                    "de données pour %s 🔥🔥",
-                    compteur.sectionId,
-                )
             else:
                 _LOGGER.debug(
                     "Aucune donnée hebdomadaire à stocker pour %s",
@@ -281,9 +311,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
 
     async def _async_backgroundupdate_data(self, compteur: Compteur) -> None:
         """Background task to fetch data from API and update."""
-        _LOGGER.debug(
-            "🔥🔥🔥🔥🔥🔥 _async_backgroundupdate_data 🔥🔥🔥🔥🔥🔥",
-        )
         # Récupération de l'ancre
         await self._async_apifetch_lastknown_data(compteur)
 
@@ -296,10 +323,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         """Fetch the last known data from the API."""
         lastknown_data: SaurResponseLastKnow = (
             await self.client.get_lastknown_data(compteur.sectionId)
-        )
-        _LOGGER.debug(
-            "🔥🔥 _async_apifetch_lastknown_data %s 🔥🔥",
-            lastknown_data,
         )
 
         if lastknown_data and "readingDate" in lastknown_data:
@@ -353,11 +376,16 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     #     raise HomeAssistantError
 
     async def _async_fetch_monthly_data(
-        self, year: int, month: int, compteur: Compteur
+        self,
+        year: int,
+        month: int,
+        compteur: Compteur,
+        *,
+        reconcile_history: bool = True,
     ) -> None:
-        """Wrapper pour la récupération des données hebdomadaires."""
+        """Fetch a month and optionally reconcile the cumulative history."""
         _LOGGER.debug(
-            "🔥🔥 _async_fetch_monthly_data  %s %s no_day for %s 🔥🔥",
+            "Fetching monthly data for %s-%02d (%s)",
             year,
             month,
             compteur.sectionId,
@@ -365,25 +393,25 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         await self._async_apifetch_and_sqlstore_monthly_data(
             year, month, compteur.sectionId
         )
-        _LOGGER.debug(
-            "🔥🔥 async_get_all_consumptions_with_absolute  %s 🔥🔥",
-            compteur.sectionId,
-        )
-        # Get all consumptions from SQLITE
-        all_consumptions: TheoreticalConsumptionDatas = (
+        if not reconcile_history:
+            return
+
+        all_consumptions = await self._async_refresh_historical_data(compteur)
+
+        # Détecte et traite les jours manquants
+        await self._async_handle_missing_dates(all_consumptions, compteur)
+
+    async def _async_refresh_historical_data(
+        self, compteur: Compteur
+    ) -> TheoreticalConsumptionDatas:
+        """Recalculate and import the cumulative history for a meter."""
+        all_consumptions = (
             await self.db_helper.async_get_all_consumptions_with_absolute(
                 compteur.sectionId
             )
         )
-        _LOGGER.debug(
-            "🔥🔥 TheoreticalConsumptionDatas  %s 🔥🔥",
-            all_consumptions,
-        )
-        # Recalculate all historical data
         await self._async_inject_historical_data(all_consumptions, compteur)
-
-        # Détecte et traite les jours manquants
-        await self._async_handle_missing_dates(all_consumptions, compteur)
+        return all_consumptions
 
     async def _async_inject_historical_data(
         self,
@@ -392,44 +420,34 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
     ) -> None:
         """Injecte les données historiques dans le recorder."""
         if not all_consumptions:
+            self.latest_water_indexes.pop(compteur.sectionId, None)
             return
 
-        # Accéder à l'enregistrement des entités
-        entity_registry = async_get(self.hass)
+        today = hass_now().date()
+        current_consumptions = [
+            consumption
+            for consumption in all_consumptions
+            if datetime.fromisoformat(consumption.date).date() <= today
+        ]
+        if not current_consumptions:
+            self.latest_water_indexes.pop(compteur.sectionId, None)
+            return
 
-        # Récupérer l'entité via l'ID unique
-        entity_entry = entity_registry.async_get_entity_id(
-            "sensor", DOMAIN, f"{compteur.serial_number}_water_statistics"
+        latest_consumption = max(
+            current_consumptions,
+            key=lambda consumption: datetime.fromisoformat(consumption.date),
+        )
+        self.latest_water_indexes[compteur.sectionId] = float(
+            latest_consumption.indexValue
         )
 
-        if entity_entry:
-            # Entité trouvée
-            _LOGGER.debug(
-                "_async_inject_historical_data : Entité trouvée : %s",
-                entity_entry,
-            )
-        else:
-            # Entité non trouvée
-            _LOGGER.debug(
-                "_async_inject_historical_data : Entité non trouvée."
-            )
-            return
-
-        # default_section_id = f"{compteur.sectionId}"
-        # entity_entry = f"{compteur.serial_number}"
-        for a_consumption in all_consumptions:
-            date_formatted = datetime.fromisoformat(a_consumption.date)
-            _LOGGER.debug(
-                "🔥🔥 all_consumptions compteur.sectionId: %s %s %s 🔥🔥",
-                compteur.sectionId,
-                date_formatted,
-                a_consumption.indexValue,
-            )
-            await self.recorder.async_inject_historical_data(
-                entity_entry,
-                date_formatted,
-                a_consumption.indexValue,
-            )
+        statistic_id = water_statistic_id(compteur.sectionId)
+        statistic_name = f"Consommation d'eau SAUR {compteur.serial_number}"
+        await self.recorder.async_inject_historical_data(
+            statistic_id,
+            statistic_name,
+            all_consumptions,
+        )
 
     async def _async_handle_missing_dates(
         self,
@@ -437,15 +455,16 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         compteur: Compteur,
     ) -> None:
         """Gère les dates manquantes."""
-        _LOGGER.debug("🔥🔥 missing_dates 1/3: %s 🔥🔥", all_consumptions)
         missing_dates: MissingDates = find_missing_dates(all_consumptions)
-        _LOGGER.debug("🔥🔥 missing_dates 2/3: %s 🔥🔥", missing_dates)
 
         reduced_missing_dates = sync_reduce_missing_dates(
             missing_dates, self.blacklisted_months
         )
         _LOGGER.debug(
-            "🔥🔥 reduced_missing_dates 3/3: %s 🔥🔥", reduced_missing_dates
+            "%s missing date ranges detected for %s (%s after filtering)",
+            len(missing_dates),
+            compteur.sectionId,
+            len(reduced_missing_dates),
         )
         if reduced_missing_dates and len(reduced_missing_dates) > 0:
             # y, m, d = reduced_missing_dates.pop()
@@ -485,7 +504,9 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
                 )
                 return  # Met à jour et sort de la fonction
 
-        print(f"Compteur non trouvé dans le cache: {compteur.sectionId}")
+        _LOGGER.error(
+            "Compteur non trouvé dans le cache: %s", compteur.sectionId
+        )
 
     def _sync_fetch_monthly_data(
         self, year: int, month: int, compteur: Compteur
@@ -508,8 +529,6 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
         des points de livraison.
         """
         compteurs = saur_data.compteurs
-        for compteur in compteurs:
-            _LOGGER.debug(" J'AI UN COMPTEUR : %s", compteur)
 
         # 1. Lancer toutes les requêtes DELIVERY en parallèle
         delivery_tasks = [
@@ -525,16 +544,12 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             async_get_last_data(self.client, compteur.sectionId)
             for compteur in compteurs
         ]
-        last_results = await asyncio.gather(
-            *last_tasks, return_exceptions=True
-        )
+        last_results = await asyncio.gather(*last_tasks, return_exceptions=True)
 
         filtered_delivery_results = [
             d for d in delivery_results if isinstance(d, dict)
         ]
-        filtered_last_results = [
-            d for d in last_results if isinstance(d, dict)
-        ]
+        filtered_last_results = [d for d in last_results if isinstance(d, dict)]
 
         # 3. Mettre à jour les compteurs avec les données DELIVERY et LAST
         updated_compteurs: list[Compteur] = []

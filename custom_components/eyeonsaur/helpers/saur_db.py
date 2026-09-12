@@ -4,10 +4,12 @@
 import logging
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 from datetime import datetime
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from ..models import (
     ConsumptionDatas,
@@ -64,14 +66,9 @@ class SaurDatabaseHelper:
         def execute() -> SaurSqliteResponse:
             """Exécute la requête SQL dans un thread."""
             try:
-                with sqlite3.connect(self.db_path) as conn:
+                with closing(sqlite3.connect(self.db_path)) as conn:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
-                    _LOGGER.debug(
-                        "Exécution de la requête SQL: %s avec params : %s",
-                        query,
-                        params,
-                    )
                     cursor.execute(query, params)
                     conn.commit()
                     result = cursor.fetchall()
@@ -123,10 +120,6 @@ class SaurDatabaseHelper:
             section_id: L'identifiant unique du compteur.
 
         """
-        _LOGGER.debug(
-            "Début de la mise à jour des consommations dans la bdd pour %s",
-            section_id,
-        )
         query = """
             INSERT INTO consumptions (date, section_id,
                 relative_value, is_ancre)
@@ -136,27 +129,32 @@ class SaurDatabaseHelper:
         """
 
         count = 0
+        future_count = 0
+        today = dt_util.now().date()
         for conso in consumptions:
             if conso.rangeType == "Day":
-                date_str = datetime.fromisoformat(conso.startDate).strftime(
+                consumption_datetime = datetime.fromisoformat(conso.startDate)
+                consumption_date = (
+                    dt_util.as_local(consumption_datetime).date()
+                    if consumption_datetime.tzinfo is not None
+                    else consumption_datetime.date()
+                )
+                if consumption_date > today:
+                    future_count += 1
+                    continue
+
+                date_str = consumption_datetime.strftime(
                     "%Y-%m-%d %H:%M:%S",
                 )
-                value = conso.value
-                _LOGGER.debug(
-                    "Préparation de l'insertion/mise à jour de la consommation"
-                    " pour date=%s, value=%s, section_id=%s",
-                    date_str,
-                    value,
-                    section_id,
-                )
                 await self._async_execute_query(
-                    query, (date_str, section_id, value)
+                    query, (date_str, section_id, conso.value)
                 )
                 count += 1
         _LOGGER.debug(
-            "Mise à jour de %s consommations dans la base de données pour %s.",
+            "Stored %s daily consumptions for %s (%s future entries ignored)",
             count,
             section_id,
+            future_count,
         )
 
     async def async_update_anchor(
@@ -185,9 +183,7 @@ class SaurDatabaseHelper:
             ),
         )
 
-        _LOGGER.info(
-            "Ancre mise à jour dans la base de données pour %s.", section_id
-        )
+        _LOGGER.debug("Updated physical meter reading for %s", section_id)
 
     async def async_get_total_consumption(
         self, target_date: datetime, section_id: SectionId
@@ -255,13 +251,11 @@ class SaurDatabaseHelper:
             Une liste de TheoreticalConsumptionData.
         """
 
-        _LOGGER.debug(
-            "async_get_all_consumptions_with_absolute pour %s", section_id
-        )
-
         query = """
             WITH Anchor AS (
-            SELECT date, value FROM anchor_value WHERE section_id = ?
+            SELECT date, value FROM anchor_value
+            WHERE section_id = ?
+            ORDER BY date DESC LIMIT 1
             ),
             ConsumptionsWithCumulative AS (
             SELECT
@@ -269,27 +263,37 @@ class SaurDatabaseHelper:
                 c.relative_value,
                 SUM(c.relative_value) OVER (ORDER BY c.date ASC)
                 AS cumulative_relative
-            FROM consumptions c WHERE c.section_id = ?
+            FROM consumptions c
+            WHERE c.section_id = ? AND c.date <= ?
             ),
-            AbsoluteValues AS (
-            SELECT
-                cw.date, cw.relative_value,
-                CASE
-                WHEN cw.date = (SELECT date FROM Anchor)
-                THEN (SELECT value FROM Anchor)
-                ELSE (SELECT value FROM Anchor) + cw.cumulative_relative
-                - (SELECT cumulative_relative
-                    FROM ConsumptionsWithCumulative
-                    WHERE date = (SELECT date FROM Anchor))
-                END AS absolute_value
-            FROM ConsumptionsWithCumulative cw
+            ReferenceCumulative AS (
+            SELECT cumulative_relative
+            FROM ConsumptionsWithCumulative
+            WHERE date <= (SELECT date FROM Anchor)
+            ORDER BY date DESC
+            LIMIT 1
             )
-            SELECT date, relative_value, absolute_value FROM AbsoluteValues
-            ORDER BY date DESC;
+            SELECT
+                cw.date,
+                cw.relative_value,
+                COALESCE((SELECT value FROM Anchor), 0)
+                    + cw.cumulative_relative
+                    - COALESCE(
+                        (SELECT cumulative_relative FROM ReferenceCumulative),
+                        0
+                    )
+                    AS absolute_value
+            FROM ConsumptionsWithCumulative cw
+            ORDER BY cw.date DESC;
         """
 
         results = await self._async_execute_query(
-            query, (section_id, section_id)
+            query,
+            (
+                section_id,
+                section_id,
+                f"{dt_util.now().date().isoformat()} 23:59:59",
+            ),
         )
 
         nb_results = len(results) if results else 0
@@ -323,11 +327,14 @@ class SaurDatabaseHelper:
                         data_point
                     )  # Assuming append is the correct method
                 except ValueError as e:
-                    print(f"⚠️ Date invalide détectée : {row['date']} -> {e}")
+                    _LOGGER.error(
+                        "Date invalide détectée : %s -> %s", row["date"], e
+                    )
                 except Exception as e:
-                    print(
-                        "⚠️ Erreur lors de la création du "
-                        f"TheoreticalConsumptionData : {e}"
+                    _LOGGER.error(
+                        "Erreur lors de la création du "
+                        "TheoreticalConsumptionData : %s",
+                        e,
                     )
 
         return formatted_results

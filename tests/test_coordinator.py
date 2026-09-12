@@ -1,149 +1,272 @@
-"""Test the SaurCoordinator."""
+"""Tests for the EyeOnSaur coordinator."""
 
-from unittest.mock import AsyncMock, MagicMock
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.eyeonsaur.coordinator import SaurCoordinator
+from custom_components.eyeonsaur.device import Compteur, Compteurs
 from custom_components.eyeonsaur.helpers.const import (
-    CONF_EMAIL,
-    CONF_PASSWORD,
     DOMAIN,
-    ENTRY_CREATED_AT,
-    ENTRY_MANUFACTURER,
-    ENTRY_MODEL,
-    ENTRY_SERIAL_NUMBER,
+    ENTRY_CLIENTID,
+    ENTRY_COMPTEURID,
+    ENTRY_LOGIN,
+    ENTRY_PASS,
+    ENTRY_TOKEN,
 )
-from custom_components.eyeonsaur.helpers.saur_db import SaurDatabaseError
+from custom_components.eyeonsaur.models import (
+    ClientId,
+    Contracts,
+    ContratId,
+    RelevePhysique,
+    SaurData,
+    SectionId,
+    StrDate,
+    TheoreticalConsumptionData,
+    TheoreticalConsumptionDatas,
+)
 
 pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(name="mock_config_entry")
 def mock_config_entry_fixture() -> MockConfigEntry:
-    """Mock the config_entry fixture."""
+    """Return a complete config entry accepted by the current coordinator."""
     return MockConfigEntry(
         domain=DOMAIN,
         data={
-            CONF_EMAIL: "test@example.com",
-            CONF_PASSWORD: "password",
-            ENTRY_MANUFACTURER: "TestManuf",
-            ENTRY_MODEL: "TestModel",
-            ENTRY_SERIAL_NUMBER: "TestSN",
-            ENTRY_CREATED_AT: "2023-01-15",
+            ENTRY_LOGIN: "test@example.com",
+            ENTRY_PASS: "password",
+            ENTRY_COMPTEURID: "section-123",
+            ENTRY_TOKEN: "token",
+            ENTRY_CLIENTID: "client-123",
         },
     )
 
 
-@pytest.fixture(name="mock_saur_client")
-def mock_saur_client_fixture() -> MagicMock:
-    """Mock the SaurClient."""
-    client = MagicMock()
-    client.authenticate = AsyncMock(return_value="fake_token")
-    client.get_deliverypoints_data = AsyncMock(
-        return_value={
-            "meter": {
-                "meterBrandCode": "TestManuf",
-                "meterModelCode": "TestModel",
-                "trueRegistrationNumber": "TestSN",
-                "installationDate": "2023-01-01",
-            }
-        }
+def make_compteur() -> Compteur:
+    """Build a meter with an installation date before its physical reading."""
+    return Compteur(
+        sectionId=SectionId("SECTION-123"),
+        clientReference="reference-123",
+        clientId=ClientId("client-123"),
+        contractName="Contrat test",
+        contractId=ContratId("contract-123"),
+        isContractTerminated=False,
+        date_installation=StrDate("2024-01-15T00:00:00"),
+        pairingTechnologyCode="AMR",
+        releve_physique=RelevePhysique(
+            date=StrDate("2024-03-20T00:00:00"), valeur=100.0
+        ),
+        manufacturer="SAUR",
+        model="Test",
+        serial_number="SERIAL-123",
     )
-    client.default_section_id = "123"
-    client.get_lastknown_data = AsyncMock(
-        side_effect=[
-            None,  # Première fois : valeur vide pour first_refresh
-            {
-                "readingDate": "2024-01-15",
-                "indexValue": 123,
-            },  # Deuxième fois : valeur pour update_data_success
-            {
-                "readingDate": "2025-01-01T00:00:00",
-                "indexValue": 123,
-            },  # Troisième fois : valeur pour missing dates
-        ]
-    )
-    client.get_monthly_data = AsyncMock(
-        return_value={
-            "consumptions": [
-                {
-                    "rangeType": "Day",
-                    "startDate": "2024-01-10 00:00:00",
-                    "value": 1.234,
-                }
-            ]
-        }
-    )
-    return client
 
 
-async def test_coordinator_init(hass: HomeAssistant, mock_config_entry):
-    """Test SaurCoordinator initialization."""
+def make_coordinator(
+    hass: HomeAssistant, entry: MockConfigEntry
+) -> tuple[SaurCoordinator, AsyncMock, AsyncMock]:
+    """Build a coordinator with mocked persistence services."""
     db_helper = AsyncMock()
     recorder = AsyncMock()
-    coordinator = SaurCoordinator(hass, mock_config_entry, db_helper, recorder)
+    client = MagicMock()
+    client.close_session = AsyncMock()
+    with patch(
+        "custom_components.eyeonsaur.coordinator.SaurClient",
+        return_value=client,
+    ):
+        coordinator = SaurCoordinator(hass, entry, db_helper, recorder)
+    return coordinator, db_helper, recorder
 
-    assert coordinator.client is not None
+
+async def test_coordinator_init(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Coordinator keeps the injected persistence services."""
+    coordinator, db_helper, recorder = make_coordinator(hass, mock_config_entry)
     assert coordinator.db_helper is db_helper
     assert coordinator.recorder is recorder
     assert coordinator.data is None
 
 
-async def test_async_config_entry_first_refresh_success(
+async def test_initial_backfill_schedules_every_month_from_installation(
     hass: HomeAssistant,
-    mock_config_entry,
-    mock_saur_client,
-):
-    """Test successful first refresh."""
-    db_helper = AsyncMock()
-    recorder = AsyncMock()
-    coordinator = SaurCoordinator(hass, mock_config_entry, db_helper, recorder)
-    coordinator.client = mock_saur_client
-
-    # Mock data for deliverypoints
-    mock_saur_client.get_deliverypoints_data.return_value = {
-        "meter": {
-            "installationDate": "2023-01-01",
-            "meterBrandCode": "TestManuf",
-            "meterModelCode": "TestModel",
-            "trueRegistrationNumber": "TestSN",
+    mock_config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An empty installation month cannot prevent later-month backfill."""
+    mock_config_entry.add_to_hass(hass)
+    coordinator, db_helper, _ = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    saur_data = SaurData(
+        saurClientId=ClientId("client-123"),
+        compteurs=Compteurs([compteur]),
+        contracts=Contracts([]),
+    )
+    coordinator.client.get_contracts = AsyncMock(
+        return_value={
+            "clients": [
+                {
+                    "clientId": "client-123",
+                    "contractName": "Contrat test",
+                    "address": "PRIVATE-STREET-SENTINEL",
+                }
+            ]
         }
-    }
+    )
+    coordinator.client.access_token = "token"
+    coordinator.update_compteurs_with_delivery_points = AsyncMock(
+        return_value=saur_data
+    )
 
-    await coordinator.async_config_entry_first_refresh()
+    with (
+        caplog.at_level(
+            "DEBUG", logger="custom_components.eyeonsaur.coordinator"
+        ),
+        patch(
+            "custom_components.eyeonsaur.coordinator."
+            "extract_compteurs_from_area",
+            return_value=Compteurs([compteur]),
+        ),
+        patch(
+            "custom_components.eyeonsaur.coordinator.hass_now",
+            return_value=datetime(2024, 4, 10, tzinfo=UTC),
+        ),
+        patch.object(
+            coordinator, "_async_fetch_monthly_data", new_callable=AsyncMock
+        ) as fetch_month,
+        patch(
+            "homeassistant.helpers.update_coordinator.DataUpdateCoordinator."
+            "async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ),
+    ):
+        await coordinator.async_config_entry_first_refresh()
+        await hass.async_block_till_done()
 
     db_helper.async_init_db.assert_awaited_once()
-    mock_saur_client.authenticate.assert_awaited_once()
-    mock_saur_client.get_deliverypoints_data.assert_awaited_once()
-
-    assert coordinator.base_data is not None
-    assert coordinator.base_data["releve_physique"]["date"] is None
-    assert coordinator.base_data["releve_physique"]["valeur"] is None
-    assert coordinator.base_data["created_at"] == "2023-01-01"
-    assert (
-        coordinator.base_data["section_id"]
-        == mock_saur_client.default_section_id
+    assert [
+        (call.kwargs["year"], call.kwargs["month"])
+        for call in fetch_month.await_args_list
+    ] == [(2024, 1), (2024, 2), (2024, 3), (2024, 4)]
+    assert all(
+        call.kwargs["reconcile_history"] is False
+        for call in fetch_month.await_args_list
     )
-    assert coordinator.base_data["manufacturer"] == "TestManuf"
-    assert coordinator.base_data["model"] == "TestModel"
-    assert coordinator.base_data["serial_number"] == "TestSN"
+    assert "Retrieved 1 contract(s) and 1 meter(s) from SAUR" in caplog.text
+    assert "PRIVATE-STREET-SENTINEL" not in caplog.text
 
 
-async def test_async_config_entry_first_refresh_db_failure(
-    hass: HomeAssistant, mock_config_entry, mock_saur_client
-):
-    """Test first refresh with database initialization failure."""
-    db_helper = AsyncMock()
-    recorder = AsyncMock()
-    coordinator = SaurCoordinator(hass, mock_config_entry, db_helper, recorder)
-    coordinator.client = mock_saur_client
-    db_helper.async_init_db.side_effect = SaurDatabaseError("Database error")
+async def test_historical_injection_does_not_use_entity_registry(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Coordinator imports directly to the stable external statistic ID."""
+    coordinator, _, recorder = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    consumptions = TheoreticalConsumptionDatas(
+        [
+            TheoreticalConsumptionData(
+                date=StrDate("2024-01-02 00:00:00"), indexValue=101.5
+            ),
+            TheoreticalConsumptionData(
+                date=StrDate("2024-01-01 00:00:00"), indexValue=100.0
+            ),
+        ]
+    )
 
-    with pytest.raises(UpdateFailed) as excinfo:
-        await coordinator.async_config_entry_first_refresh()
+    await coordinator._async_inject_historical_data(consumptions, compteur)
 
-    assert "Error initializing database" in str(excinfo.value)
+    recorder.async_inject_historical_data.assert_awaited_once_with(
+        "eyeonsaur:section_123_water_consumption",
+        "Consommation d'eau SAUR SERIAL-123",
+        consumptions,
+    )
+    assert coordinator.latest_water_indexes[compteur.sectionId] == 101.5
+
+
+async def test_periodic_update_refreshes_index_after_weekly_and_anchor_data(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """The display sensor and external statistic stay current after setup."""
+    coordinator, _, _ = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    coordinator._cached_data = SaurData(
+        saurClientId=ClientId("client-123"),
+        compteurs=Compteurs([compteur]),
+        contracts=Contracts([]),
+    )
+    coordinator._async_fetch_and_store_weekly_data = AsyncMock()
+    coordinator._async_backgroundupdate_data = AsyncMock()
+    coordinator._async_refresh_historical_data = AsyncMock(
+        return_value=TheoreticalConsumptionDatas([])
+    )
+    coordinator._async_handle_missing_dates = AsyncMock()
+
+    result = await coordinator._async_update_data()
+
+    assert result is coordinator._cached_data
+    coordinator._async_fetch_and_store_weekly_data.assert_awaited_once_with(
+        compteur=compteur
+    )
+    coordinator._async_backgroundupdate_data.assert_awaited_once_with(compteur)
+    coordinator._async_refresh_historical_data.assert_awaited_once_with(
+        compteur
+    )
+    coordinator._async_handle_missing_dates.assert_awaited_once_with(
+        TheoreticalConsumptionDatas([]), compteur
+    )
+
+
+async def test_initial_month_fetch_defers_history_reconciliation(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Bulk backfill stores each month without repeatedly importing history."""
+    coordinator, _, _ = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    coordinator._async_apifetch_and_sqlstore_monthly_data = AsyncMock()
+    coordinator._async_refresh_historical_data = AsyncMock()
+    coordinator._async_handle_missing_dates = AsyncMock()
+
+    await coordinator._async_fetch_monthly_data(
+        2024,
+        1,
+        compteur,
+        reconcile_history=False,
+    )
+
+    coordinator._async_apifetch_and_sqlstore_monthly_data.assert_awaited_once_with(
+        2024, 1, compteur.sectionId
+    )
+    coordinator._async_refresh_historical_data.assert_not_awaited()
+    coordinator._async_handle_missing_dates.assert_not_awaited()
+
+
+async def test_estimated_index_ignores_future_consumptions(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """A future API placeholder must not become the displayed index."""
+    coordinator, _, recorder = make_coordinator(hass, mock_config_entry)
+    compteur = make_compteur()
+    consumptions = TheoreticalConsumptionDatas(
+        [
+            TheoreticalConsumptionData(
+                date=StrDate("2026-08-28 00:00:00"), indexValue=211.29
+            ),
+            TheoreticalConsumptionData(
+                date=StrDate("2026-08-29 00:00:00"), indexValue=999.0
+            ),
+        ]
+    )
+
+    with patch(
+        "custom_components.eyeonsaur.coordinator.hass_now",
+        return_value=datetime(2026, 8, 28, 12, tzinfo=UTC),
+    ):
+        await coordinator._async_inject_historical_data(consumptions, compteur)
+
+    assert coordinator.latest_water_indexes[compteur.sectionId] == 211.29
+    recorder.async_inject_historical_data.assert_awaited_once()

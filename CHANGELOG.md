@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.1.13] - 2026-09-12
+
+### Added
+
+- Ajout d'une statistique externe cumulative pour la consommation d'eau,
+  identifiée par `eyeonsaur:<section_id>_water_consumption`.
+- Ajout du capteur d'affichage **Index estimé du compteur**, indépendant de la
+  statistique externe et sans génération automatique de statistiques.
+- Ajout de tests de régression pour les ancres, le backfill, les dates futures,
+  les métadonnées Recorder et la confidentialité des logs.
+
+### Fixed
+
+- Le backfill initial parcourt désormais tous les mois depuis l'installation,
+  même lorsque le mois d'installation ne contient aucune consommation.
+- Le calcul cumulatif utilise correctement une ancre située avant ou entre deux
+  consommations et conserve uniquement l'ancre la plus récente.
+- Les consommations datées après la date locale Home Assistant sont ignorées.
+- L'historique n'utilise plus l'identifiant d'une entité `sensor`, évitant les
+  conflits avec les statistiques automatiques `total_increasing`.
+- Les métadonnées Recorder utilisent l'API compatible Home Assistant 2026.11.
+
+### Changed
+
+- L'import historique est réconcilié une seule fois après le backfill initial.
+- Les payloads SAUR sensibles et les traces SQL ligne par ligne ont été retirés
+  des logs de debug.
+
+### Migration
+
+- Les installations utilisant l'ancienne statistique `sensor.*` doivent
+  sélectionner la nouvelle statistique externe `eyeonsaur:*` comme source
+  d'eau dans le dashboard Énergie. Aucune donnée Recorder n'est supprimée ou
+  migrée automatiquement.
+
 ## [v1.1.11] - 2024-02-28 (+v1.1.9 + fix DEV + FIX pypi + fix UTC)
 
 ### Added

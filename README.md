@@ -15,7 +15,7 @@
 
 **EyeOnSaur** est une intégration Home Assistant qui permet de suivre votre consommation d'eau Saur. Elle récupère les données **passées** (donc au mieux, la veille), mises à jour quotidiennement et *non en temps réel*, depuis votre compte Saur via une API non officielle. Les données sont structurées par **contrat**, puis par **compteur**. Chaque compteur expose des **données fixes** (date d'installation, numéro de série) et des **données de relevé** (date du relevé, valeur du relevé).
 
-L'intégration injecte les données directement dans le tableau de bord "Énergie" de Home Assistant pour un suivi quotidien, hebdomadaire, mensuel et un historique de votre consommation. **Le capteur *Panneau Énergie* est *exclusivement* conçu pour être utilisé avec le tableau de bord "Énergie" de Home Assistant. Sa valeur restera toujours "inconnue", les données étant directement injectées dans l'historique du tableau de bord.**
+L'intégration injecte les données dans une statistique externe Home Assistant pour un suivi quotidien, hebdomadaire, mensuel et historique dans le tableau de bord "Énergie". Elle expose également un capteur **Index estimé du compteur** pour afficher la dernière valeur cumulative calculée. Ce capteur d'affichage reste indépendant de la statistique historique.
 
 ## À propos de Saur
 
@@ -24,7 +24,7 @@ L'intégration injecte les données directement dans le tableau de bord "Énergi
 ## Fonctionnalités
 
 *   **Intégration au tableau de bord Énergie :** Injecte les données de consommation d'eau (données de la veille, non temps réel) directement dans l'historique utilisé par le tableau de bord "Énergie" de Home Assistant pour un suivi quotidien, hebdomadaire, mensuel et un historique. *Le compteur d'eau doit être ajouté au tableau de bord Énergie par l'utilisateur.*
-*   **Capteur "Panneau Énergie" :** Crée un capteur *Panneau Énergie* qui est *exclusivement* utilisé par le tableau de bord "Énergie". Sa valeur restera toujours "inconnue".
+*   **Index estimé du compteur :** Affiche le dernier index cumulatif calculé à partir des relevés Saur. Ce capteur n'est pas utilisé comme identifiant de statistique par le tableau de bord Énergie.
 *   **Informations du compteur :** Expose des informations fixes liées au compteur (date d'installation, numéro de série) et des informations de relevé (date du relevé, valeur du relevé).
 *   **Configuration via l'interface utilisateur :** Configuration simple via l'interface web de Home Assistant.
 
@@ -72,7 +72,7 @@ Une fois l'intégration EyeOnSaur installée et configurée, elle injecte direct
 1.  **Ajout du compteur d'eau au tableau de bord Énergie :**
     *   Allez dans Paramètres -> Tableaux de bord -> Énergie.
     *   Cliquez sur "Ajouter une consommation".
-    *   Dans la liste déroulante "Consommation d'eau", sélectionnez le capteur `sensor.compteur_NumeroDeSerieDuCompteur_panneau_energie` créé par l'intégration EyeOnSaur. *L'interface affichera un message d'erreur : "⚠️ Entité indisponible L'état de ces entités configurées n'est actuellement pas disponible : sensor.compteur_NumeroDeSerieDuCompteur_panneau_energie (unknown)". Ce comportement est normal.*
+    *   Dans la liste déroulante "Consommation d'eau", sélectionnez la statistique externe nommée `Consommation d'eau SAUR NumeroDeSerieDuCompteur`. Son identifiant stable est de la forme `eyeonsaur:<section_id>_water_consumption`.
     *   Cliquez sur "Enregistrer".
 
 2.  **Visualisation de votre consommation :**

@@ -1,18 +1,15 @@
 # tests/test_saur_db.py
-import asyncio
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Final
+from unittest.mock import patch
 
 import pytest
 from homeassistant.core import HomeAssistant
 
-from custom_components.eyeonsaur.helpers.saur_db import (
-    SaurDatabaseError,
-    SaurDatabaseHelper,
-)
+from custom_components.eyeonsaur.helpers.saur_db import SaurDatabaseHelper
 from custom_components.eyeonsaur.models import (
     ConsumptionData,
     ConsumptionDatas,
@@ -67,16 +64,14 @@ async def temp_db(
                 try:
                     os.remove(db_helper.db_path)
                 except Exception as e:
-                    print(
-                        f"Error deleting db file: {e}"
-                    )  # Debug delete errors
+                    print(f"Error deleting db file: {e}")  # Debug delete errors
 
 
 @pytest.fixture(name="db_helper")
 async def db_helper_fixture(
     hass: HomeAssistant,
 ) -> AsyncGenerator[SaurDatabaseHelper, None]:
-    """Fixture to create a SaurDatabaseHelper instance with a temporary database."""
+    """Create a helper backed by a temporary database."""
     async with temp_db(hass, DB_FILE) as db_helper:
         # Vider les tables avant chaque test
         await db_helper._async_execute_query("DELETE FROM consumptions")
@@ -160,7 +155,9 @@ async def test_async_init_db(db_helper: SaurDatabaseHelper) -> None:
     await db_helper._async_execute_query("SELECT 1")
 
 
-async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
+async def test_async_write_consumptions(
+    db_helper: SaurDatabaseHelper, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test async_write_consumptions."""
     await db_helper._async_execute_query("DELETE FROM consumptions")
     await db_helper._async_execute_query("DELETE FROM anchor_value")
@@ -168,7 +165,7 @@ async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
         [
             ConsumptionData(
                 startDate=StrDate("2024-01-01 00:00:00"),
-                value=1.0,
+                value=9876.543,
                 rangeType="Day",
             ),
             ConsumptionData(
@@ -178,9 +175,17 @@ async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
             ),
         ]
     )
-    await db_helper.async_write_consumptions(
-        consumptions, TEST_SECTION_ID
-    )  # Pass section_id
+    caplog.clear()
+    with caplog.at_level(
+        "DEBUG", logger="custom_components.eyeonsaur.helpers.saur_db"
+    ):
+        await db_helper.async_write_consumptions(
+            consumptions, TEST_SECTION_ID
+        )  # Pass section_id
+
+    assert "Stored 2 daily consumptions" in caplog.text
+    assert "9876.543" not in caplog.text
+    assert "INSERT INTO consumptions" not in caplog.text
 
     # Vérifier que les données sont bien écrites dans la base
     rows: SaurSqliteResponse = await db_helper._async_execute_query(
@@ -189,7 +194,7 @@ async def test_async_write_consumptions(db_helper: SaurDatabaseHelper) -> None:
     assert rows is not None
     assert len(rows) == 2
     assert rows[0]["date"] == "2024-01-01 00:00:00"
-    assert rows[0]["relative_value"] == 1.0
+    assert rows[0]["relative_value"] == 9876.543
     assert rows[0]["section_id"] == TEST_SECTION_ID
     assert rows[1]["date"] == "2024-01-02 00:00:00"
     assert rows[1]["relative_value"] == 2.0
@@ -289,6 +294,123 @@ async def test_async_get_all_consumptions_with_absolute2(
     assert result[2].indexValue == 113.18  # Corrected value
     assert result[3].date == "2024-10-19 00:00:00"
     assert result[3].indexValue == 112.68  # Corrected value
+
+
+async def _replace_consumptions_and_anchors(
+    db_helper: SaurDatabaseHelper,
+    anchors: list[RelevePhysique],
+) -> TheoreticalConsumptionDatas:
+    """Replace fixture data with a compact cumulative test series."""
+    await db_helper._async_execute_query("DELETE FROM consumptions")
+    await db_helper._async_execute_query("DELETE FROM anchor_value")
+    consumptions = ConsumptionDatas(
+        [
+            ConsumptionData(StrDate("2024-01-01 00:00:00"), 1.0, "Day"),
+            ConsumptionData(StrDate("2024-01-02 00:00:00"), 2.0, "Day"),
+            ConsumptionData(StrDate("2024-01-03 00:00:00"), 3.0, "Day"),
+            ConsumptionData(StrDate("2024-01-04 00:00:00"), 4.0, "Day"),
+        ]
+    )
+    await db_helper.async_write_consumptions(consumptions, TEST_SECTION_ID)
+    for anchor in anchors:
+        await db_helper.async_update_anchor(anchor, TEST_SECTION_ID)
+    return await db_helper.async_get_all_consumptions_with_absolute(
+        TEST_SECTION_ID
+    )
+
+
+async def test_anchor_exactly_matches_consumption(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """An exact anchor row has exactly the physical meter index."""
+    result = await _replace_consumptions_and_anchors(
+        db_helper,
+        [RelevePhysique(StrDate("2024-01-02 00:00:00"), 100.0)],
+    )
+    values = {item.date: item.indexValue for item in result}
+    assert values["2024-01-02 00:00:00"] == 100.0
+    assert values["2024-01-04 00:00:00"] == 107.0
+
+
+async def test_anchor_precedes_first_consumption(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """An orphan anchor before the series uses a zero cumulative reference."""
+    result = await _replace_consumptions_and_anchors(
+        db_helper,
+        [RelevePhysique(StrDate("2023-12-31 00:00:00"), 100.0)],
+    )
+    values = {item.date: item.indexValue for item in result}
+    assert values["2024-01-01 00:00:00"] == 101.0
+    assert values["2024-01-04 00:00:00"] == 110.0
+
+
+async def test_anchor_between_two_consumptions(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """An orphan anchor uses the last cumulative value before its timestamp."""
+    result = await _replace_consumptions_and_anchors(
+        db_helper,
+        [RelevePhysique(StrDate("2024-01-02 12:00:00"), 100.0)],
+    )
+    values = {item.date: item.indexValue for item in result}
+    assert values["2024-01-02 00:00:00"] == 100.0
+    assert values["2024-01-03 00:00:00"] == 103.0
+
+
+async def test_only_latest_anchor_is_used(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """The newest physical reading is the sole cumulative reference."""
+    result = await _replace_consumptions_and_anchors(
+        db_helper,
+        [
+            RelevePhysique(StrDate("2024-01-01 00:00:00"), 100.0),
+            RelevePhysique(StrDate("2024-01-03 00:00:00"), 200.0),
+        ],
+    )
+    values = {item.date: item.indexValue for item in result}
+    assert values["2024-01-03 00:00:00"] == 200.0
+    assert values["2024-01-04 00:00:00"] == 204.0
+    assert values["2024-01-01 00:00:00"] == 195.0
+
+
+async def test_future_consumptions_are_not_stored_or_used(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """SAUR's future zero placeholders never enter the cumulative series."""
+    await db_helper._async_execute_query("DELETE FROM consumptions")
+    await db_helper._async_execute_query("DELETE FROM anchor_value")
+    consumptions = ConsumptionDatas(
+        [
+            ConsumptionData(StrDate("2026-08-26 00:00:00"), 1.0, "Day"),
+            ConsumptionData(StrDate("2026-08-27 00:00:00"), 2.0, "Day"),
+            ConsumptionData(StrDate("2026-08-28 00:00:00"), 0.0, "Day"),
+            ConsumptionData(StrDate("2026-08-31 00:00:00"), 0.0, "Day"),
+        ]
+    )
+
+    with patch(
+        "custom_components.eyeonsaur.helpers.saur_db.dt_util.now",
+        return_value=datetime(2026, 8, 27, 12, tzinfo=UTC),
+    ):
+        await db_helper.async_write_consumptions(consumptions, TEST_SECTION_ID)
+        result = await db_helper.async_get_all_consumptions_with_absolute(
+            TEST_SECTION_ID
+        )
+
+    rows = await db_helper._async_execute_query(
+        "SELECT date FROM consumptions ORDER BY date"
+    )
+    assert rows is not None
+    assert [row["date"] for row in rows] == [
+        "2026-08-26 00:00:00",
+        "2026-08-27 00:00:00",
+    ]
+    assert [item.date for item in result] == [
+        "2026-08-27 00:00:00",
+        "2026-08-26 00:00:00",
+    ]
 
 
 async def test_async_get_all_consumptions_with_absolute3(
